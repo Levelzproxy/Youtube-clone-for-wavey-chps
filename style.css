@@ -1677,3 +1677,6 @@ body.guide-collapsed .page { transition: margin-left .15s ease; }
 
 /* mobile bottom nav override: must come after the base display:none rule */
 @media (max-width: 791px) { .bottom-nav { display: flex; } }
+
+/* clickable Shorts poster */
+.short-frame[data-playing="0"] { cursor: pointer; }
