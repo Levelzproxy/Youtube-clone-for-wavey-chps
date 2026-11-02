@@ -1013,39 +1013,71 @@ YT.api = (function () {
     });
   };
 
-  api.channelVideos = function (id, sort, page) {
+  api.channelVideos = function (id, sort, page, force) {
     const s = sort || 'newest';
     const p = page || 1;
-    return cached('chvideos:' + id + ':' + s + ':' + p, 15 * 60e3, async () => {
-      try {
-        const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/videos?sort_by=' + s + '&page=' + p);
-        const videos = (d.videos || []).map(v => normInvVideo(v)).filter(Boolean);
-        return { videos: videos, more: videos.length >= 20 };
-      } catch (e) {
-        if (p > 1) return { videos: [], more: false };
-        const c = await api.piped('/channel/' + encodeURIComponent(id));
-        if (!c.nextpage) {
-          return { videos: (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean), more: false };
+    const key = 'chvideos2:' + id + ':' + s + ':' + p;
+    return cached(key, force ? 0 : 15 * 60e3, async () => {
+      if (p > 1) {
+        try {
+          const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/videos?sort_by=' + s + '&page=' + p, { timeout: 9000 });
+          const videos = (d.videos || []).map(v => normInvVideo(v)).filter(Boolean);
+          return { videos: videos, more: videos.length >= 20 };
+        } catch (e) {
+          return { videos: [], more: false };
         }
-        const d = await api.piped('/nextpage/channel/' + encodeURIComponent(id) + '?nextpage=' + encodeURIComponent(c.nextpage));
-        return {
-          videos: (d.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean),
-          more: !!d.nextpage
-        };
       }
+
+      try {
+        const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/videos?sort_by=' + s + '&page=1', { timeout: 9000 });
+        const videos = (d.videos || []).map(v => normInvVideo(v)).filter(Boolean);
+        if (videos.length) return { videos: videos, more: videos.length >= 20 };
+      } catch (e) { /* try Piped below */ }
+
+      try {
+        const c = await api.piped('/channel/' + encodeURIComponent(id), { timeout: 9000 });
+        if (!c.nextpage) {
+          const videos = (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
+          if (videos.length) return { videos: videos, more: false };
+        } else {
+          const d = await api.piped('/nextpage/channel/' + encodeURIComponent(id) + '?nextpage=' + encodeURIComponent(c.nextpage), { timeout: 9000 });
+          const videos = (d.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
+          if (videos.length) return { videos: videos, more: !!d.nextpage };
+        }
+      } catch (e) { /* channel view falls back to latestVideos */ }
+
+      // Never cache an empty first page. It would make a temporarily busy
+      // Invidious instance look like the channel has no videos for 15 minutes.
+      throw new Error('No channel videos');
     });
   };
 
-  api.channelShorts = function (id) {
-    return cached('chshorts:' + id, 30 * 60e3, async () => {
-      const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/shorts');
-      return (d.videos || []).map(v => normInvVideo(v, { short: true })).filter(Boolean);
-    });
+  api.channelShorts = function (id, force, name) {
+    return cached('chshorts2:' + id, force ? 0 : 30 * 60e3, async () => {
+      let list = [];
+      try {
+        const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/shorts', { timeout: 9000 });
+        list = (d.videos || []).map(v => normInvVideo(v, { short: true })).filter(Boolean);
+      } catch (e) { /* try a duration-filtered search below */ }
+
+      if (!list.length && name) {
+        try {
+          const arr = await api.inv('/api/v1/search?q=' + encodeURIComponent(name + ' #shorts') + '&type=video&duration=short', { timeout: 9000 });
+          list = (Array.isArray(arr) ? arr : [])
+            .filter(v => v && v.authorId === id && v.lengthSeconds > 0 && v.lengthSeconds <= 180 && !v.liveNow && !v.isUpcoming)
+            .map(v => normInvVideo(v, { short: true }))
+            .filter(Boolean);
+        } catch (e) { /* no channel shorts available */ }
+      }
+
+      if (!list.length) throw new Error('No Shorts');
+      return list;
+    }).catch(() => []);
   };
 
-  api.channelPlaylists = function (id) {
-    return cached('chpl:' + id, 30 * 60e3, async () => {
-      const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/playlists');
+  api.channelPlaylists = function (id, force) {
+    return cached('chpl2:' + id, force ? 0 : 30 * 60e3, async () => {
+      const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/playlists', { timeout: 9000 });
       return (d.playlists || []).map(normInvPlaylist).filter(Boolean);
     });
   };
@@ -1113,6 +1145,40 @@ YT.api = (function () {
       out = out.concat(batch.slice(0, perChannel || 6));
     }
     return YT.uniqBy(out, v => v.id);
+  };
+
+  // Last-resort Shorts source. Invidious supports duration=short searches,
+  // which reliably return short-form videos even when a channel's /shorts
+  // endpoint is empty or the channel is not indexed in the Shorts tab.
+  api.searchShorts = function (queries) {
+    const list = Array.from(new Set((queries || []).filter(Boolean))).slice(0, 6);
+    if (!list.length) return Promise.resolve([]);
+    const key = 'shortsearch2:' + list.map(q => q.toLowerCase()).sort().join('|');
+    return cached(key, 20 * 60e3, async () => {
+      const batches = await YT.pool(list, 3, async function (q) {
+        const query = /shorts?/i.test(q) ? q : q + ' #shorts';
+        try {
+          const arr = await api.inv('/api/v1/search?q=' + encodeURIComponent(query) + '&type=video&duration=short', { timeout: 9000 });
+          return (Array.isArray(arr) ? arr : [])
+            .filter(v => v && v.videoId && v.lengthSeconds > 0 && v.lengthSeconds <= 180 && !v.liveNow && !v.isUpcoming)
+            .map(v => normInvVideo(v, { short: true }))
+            .filter(Boolean);
+        } catch (e) {
+          try {
+            const d = await api.piped('/search?q=' + encodeURIComponent(query) + '&filter=videos', { timeout: 9000 });
+            return (d.items || [])
+              .filter(x => x && x.duration > 0 && x.duration <= 180 && !x.livestream)
+              .map(x => normPipedStream(x, { short: true }))
+              .filter(Boolean);
+          } catch (err) { return []; }
+        }
+      });
+      let out = [];
+      for (const batch of batches) if (batch) out = out.concat(batch);
+      out = YT.uniqBy(out, v => v.id);
+      if (!out.length) throw new Error('No short search results');
+      return out;
+    });
   };
 
   api.ping = async function () {
@@ -1903,9 +1969,9 @@ YT.store = (function () {
 
   async function getShortsFeed(force) {
     const subsIds = state.subs.slice(0, 4).map(s => s.id);
-    const topicQueries = interestQueries(3);
-    const queries = Array.from(new Set(topicQueries.concat(['shorts', 'viral'])));
-    const cacheKey = 'shortsfeed:' + queries.map(q => q.toLowerCase()).sort().join('|') + ':' + subsIds.sort().join(',');
+    const topicQueries = interestQueries(4);
+    const queries = Array.from(new Set(['shorts', 'viral'].concat(topicQueries)));
+    const cacheKey = 'shortsfeed2:' + queries.map(q => q.toLowerCase()).sort().join('|') + ':' + subsIds.slice().sort().join(',');
     const ttl = force ? 0 : 20 * 60e3;
 
     return YT.api.cached(cacheKey, ttl, async () => {
@@ -1914,8 +1980,12 @@ YT.store = (function () {
       let ids = [];
       for (const batch of channelBatches) if (batch) ids = ids.concat(batch.map(c => c && c.id).filter(Boolean));
       ids = Array.from(new Set(subsIds.concat(ids))).slice(0, 8);
-      if (!ids.length) throw new Error('No channels');
-      const shorts = await YT.api.shortsForChannels(ids, 8);
+
+      const [channelShorts, searchShorts] = await Promise.all([
+        ids.length ? YT.api.shortsForChannels(ids, 8).catch(() => []) : Promise.resolve([]),
+        YT.api.searchShorts(queries).catch(() => [])
+      ]);
+      const shorts = YT.uniqBy(channelShorts.concat(searchShorts), v => v.id);
       if (!shorts.length) throw new Error('No shorts');
       const ranked = rank(shorts, { limit: 48, explore: 2.2, channelCap: 4 });
       return YT.shuffle(ranked.slice(0, 20)).concat(ranked.slice(20));
@@ -3972,7 +4042,7 @@ YT.player = (function () {
     const published = v.publishedText || (v.published ? YT.timeAgo(v.published) : '');
     return '<section class="short" data-short-id="' + YT.esc(v.id) + '">' +
       '<div class="short-stage">' +
-        '<div class="short-frame" data-id="' + YT.esc(v.id) + '" data-playing="0">' + shortFrameInner(v) + '</div>' +
+        '<div class="short-frame" data-act="short-play" data-id="' + YT.esc(v.id) + '" data-playing="0">' + shortFrameInner(v) + '</div>' +
         '<div class="short-shade"></div>' +
         '<div class="short-overlay">' +
           '<div class="short-channel-row">' +
@@ -4185,7 +4255,7 @@ YT.player = (function () {
   }
 
   function channelShortsGrid(list) {
-    if (!list.length) return h.empty('shorts', 'No Shorts on this channel', '');
+    if (!list.length) return h.empty('shorts', 'No Shorts on this channel', 'This channel may not have any, or the public source did not return them.', '<button class="btn" data-act="channel-retry-shorts">Retry</button>');
     return '<div class="shorts-grid">' + list.map(v => YT.ui.shortCard(v)).join('') + '</div>';
   }
 
@@ -4196,27 +4266,42 @@ YT.player = (function () {
       '</div>' +
       '<div id="channelGrid">' + (channelState.videos.length
         ? '<div class="grid">' + channelState.videos.map(v => YT.ui.videoCard(v)).join('') + '</div>'
-        : h.empty('play', 'No videos yet', '')) + '</div>' +
+        : h.empty('play', 'No videos yet', '', '<button class="btn btn-filled" data-act="channel-retry-videos">Retry</button>')) + '</div>' +
       (channelState.more ? '<div style="margin-top:20px"><button class="btn" data-act="channel-more">Show more</button></div>' : '');
   }
 
-  async function loadChannelVideos(token, ch) {
+  async function loadChannelVideos(token, ch, force) {
     const mount = YT.$('#channelContent');
     if (!mount) return;
-    mount.innerHTML = '<div class="sort-row">' +
+    const sortRow = '<div class="sort-row">' +
       [['newest', 'Latest'], ['popular', 'Popular'], ['oldest', 'Oldest']].map(s =>
         '<button class="chip ' + (channelState.sort === s[0] ? 'active' : '') + '" data-act="channel-sort" data-sort="' + s[0] + '">' + s[1] + '</button>').join('') +
-      '</div>' + h.skeleton(8);
+      '</div>';
+    mount.innerHTML = sortRow + h.skeleton(8);
     try {
-      const res = await YT.api.channelVideos(ch.id, channelState.sort, 1);
+      const res = await YT.api.channelVideos(ch.id, channelState.sort, 1, !!force);
       if (!h.alive(token) || !mount.isConnected) return;
-      channelState.videos = res.videos || [];
-      channelState.more = !!res.more;
+      let videos = res.videos || [];
+      if (!videos.length && ch.latestVideos && ch.latestVideos.length) {
+        videos = ch.latestVideos.slice(0, 20);
+        YT.toast('Showing latest uploads');
+      }
+      channelState.videos = videos;
+      channelState.more = (res.videos && res.videos.length) ? !!res.more : false;
       channelState.page = 1;
       mount.innerHTML = channelVideosView();
     } catch (e) {
-      if (!h.alive(token)) return;
-      mount.innerHTML = YT.ui.errorBox('This channel\'s videos could not be loaded.');
+      if (!h.alive(token) || !mount.isConnected) return;
+      if (ch.latestVideos && ch.latestVideos.length) {
+        channelState.videos = ch.latestVideos.slice(0, 20);
+        channelState.more = false;
+        channelState.page = 1;
+        mount.innerHTML = channelVideosView();
+        YT.toast('Showing latest uploads');
+      } else {
+        mount.innerHTML = YT.ui.errorBox('This channel\'s videos could not be loaded.') +
+          '<div style="margin-top:16px"><button class="btn btn-filled" data-act="channel-retry-videos">Retry</button></div>';
+      }
     }
   }
 
@@ -4262,7 +4347,15 @@ YT.player = (function () {
       }
       if (act === 'channel-sort') {
         channelState.sort = ds.sort;
-        loadChannelVideos(token, ch);
+        loadChannelVideos(token, ch, true);
+        return true;
+      }
+      if (act === 'channel-retry-videos') {
+        loadChannelVideos(token, ch, true);
+        return true;
+      }
+      if (act === 'channel-retry-shorts') {
+        YT.views.show('channel', new URLSearchParams('id=' + encodeURIComponent(ch.id) + '&tab=shorts'), {});
         return true;
       }
       if (act === 'channel-more') {
@@ -4285,14 +4378,14 @@ YT.player = (function () {
 
     if (tab === 'videos') {
       channelState.sort = 'newest';
-      loadChannelVideos(token, ch);
+      loadChannelVideos(token, ch, true);
       return;
     }
 
     if (tab === 'shorts') {
       mount.innerHTML = '<div class="shorts-grid">' + Array.from({ length: 8 }).map(() => '<div class="short-card sk"><div class="sk-thumb" style="aspect-ratio:9/16"></div></div>').join('') + '</div>';
       try {
-        const shorts = await YT.api.channelShorts(ch.id);
+        const shorts = await YT.api.channelShorts(ch.id, false, ch.name);
         if (!h.alive(token) || !mount.isConnected) return;
         mount.innerHTML = channelShortsGrid(shorts);
       } catch (e) {
@@ -4305,7 +4398,7 @@ YT.player = (function () {
     if (tab === 'playlists') {
       mount.innerHTML = h.skeleton(6);
       try {
-        const playlists = await YT.api.channelPlaylists(ch.id);
+        const playlists = await YT.api.channelPlaylists(ch.id, false);
         if (!h.alive(token) || !mount.isConnected) return;
         mount.innerHTML = playlists.length
           ? '<div class="grid">' + playlists.map(p => YT.ui.playlistCard(p)).join('') + '</div>'
@@ -4332,7 +4425,7 @@ YT.player = (function () {
       '<div id="channelShortsShelf"></div>';
     if (!latest.length) mount.innerHTML = h.empty('play', 'No videos yet', '');
 
-    YT.api.channelShorts(ch.id).then(shorts => {
+    YT.api.channelShorts(ch.id, false, ch.name).then(shorts => {
       const shelf = YT.$('#channelShortsShelf');
       if (!shelf || !h.alive(token) || !shorts.length) return;
       shelf.innerHTML = YT.ui.shelf('Shorts', shorts, { short: true, icon: 'shorts-fill', href: '#/channel/' + encodeURIComponent(ch.id) + '/shorts' });
