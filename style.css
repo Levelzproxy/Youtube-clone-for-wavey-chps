@@ -479,6 +479,8 @@ body.guide-collapsed .page { margin-left: 72px; }
 .card-menu:hover { background: var(--bg-hover); }
 .card:hover .card-menu, .card-menu:focus-visible { opacity: 1; }
 @media (hover: none) { .card-menu { opacity: 1; } }
+.card-actions { display: flex; align-items: flex-start; flex: none; margin: 2px -6px 0 0; }
+.card-actions .card-menu { margin: 0; }
 
 .card.hidden-card { display: none; }
 .card.compact-row { flex-direction: row; gap: 8px; }
@@ -785,6 +787,15 @@ body.guide-collapsed .page { margin-left: 72px; }
 }
 .player-error p { color: #aaa; font-size: 13px; max-width: 440px; }
 .player-error .btn { background: #fff; color: #0f0f0f; }
+.player-sound-hint {
+  position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  z-index: 7; display: inline-flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-radius: 20px; background: rgba(0,0,0,.78); color: #fff;
+  font-size: 13px; font-weight: 500; white-space: nowrap; cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+.player-sound-hint:hover { background: rgba(0,0,0,.92); }
+.player-sound-hint .icon { width: 20px; height: 20px; }
 
 .watch-title {
   font-size: 20px; font-weight: 700; line-height: 28px; margin: 14px 0 0;
@@ -1043,6 +1054,7 @@ body.theater .player-shell { border-radius: 0; }
 .short-nav .icon { width: 26px; height: 26px; }
 .short-actions-top { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; z-index: 5; }
 .short-top-btn { width: 36px; height: 36px; border-radius: 50%; background: rgba(0,0,0,.45); color: #fff; display: flex; align-items: center; justify-content: center; }
+.short-top-btn.muted { color: rgba(255,255,255,.62); }
 .short-empty { height: calc(100dvh - 56px); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text-2); }
 
 /* ------------------------------ library / history ---------------------- */
