@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0f0f0f">
-<meta name="description" content="A YouTube-style front end powered by public YouTube data. Search, Shorts, channels, comments and a feed that learns what you like.">
+<meta name="description" content="WaveyTube is a browser video front end powered by public video data. Search, Shorts, channels, comments and a feed that learns what you like.">
 <title>WaveyTube</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 20'%3E%3Crect width='28' height='20' rx='5' fill='%23f00'/%3E%3Cpath d='M11.5 14.5v-9l7.5 4.5z' fill='white'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="style.css?v=4">
+<link rel="stylesheet" href="style.css?v=6">
 <script>
   /* Paint the right theme before the stylesheet runs to avoid a flash. */
   try {
@@ -116,7 +116,7 @@
         <path d="M11.43 14.29 18.85 10l-7.42-4.29Z" fill="#fff"/>
       </svg>
       <span class="logo-word">WaveyTube</span>
-      <sup class="logo-country">made by chps</sup>
+      <span class="logo-made">made by chps</span>
     </a>
   </div>
 
@@ -157,7 +157,7 @@
       <span class="notif-badge hidden" id="notifBadge"></span>
     </button>
     <button class="avatar-btn" id="avatarBtn" aria-label="Account" title="Account">
-      <span class="avatar avatar-user" id="headerAvatar">Y</span>
+      <span class="avatar avatar-user" id="headerAvatar" aria-hidden="true"></span>
     </button>
   </div>
 </header>
@@ -185,9 +185,9 @@
 <div id="toastRoot" class="toast-root" role="status" aria-live="polite"></div>
 
 <noscript>
-  <div class="noscript">This YouTube clone needs JavaScript to load videos from YouTube.</div>
+  <div class="noscript">This WaveyTube clone needs JavaScript to load videos.</div>
 </noscript>
 
-<script src="script.js?v=4"></script>
+<script src="script.js?v=6"></script>
 </body>
 </html>
