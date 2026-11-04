@@ -399,8 +399,8 @@ YT.scrollTop = function (smooth) {
   catch (e) { window.scrollTo(0, 0); }
 };
 /* =========================================================================
-   02 · API — real YouTube data without an API key
-   Primary source: Piped (public instances, CORS enabled, proxies YouTube).
+   02 · API — real WaveyTube data without an API key
+   Primary source: Piped (public instances, CORS enabled, proxies WaveyTube).
    Fallback: Invidious (channel pages, shorts, playlists).
    Nothing here needs a key or a server.
    ========================================================================= */
@@ -550,7 +550,7 @@ YT.api = (function () {
       api.using = base;
       return data;
     }
-    throw lastErr || new Error('YouTube data source unavailable');
+    throw lastErr || new Error('WaveyTube data source unavailable');
   };
 
   api.inv = async function (path, opts) {
@@ -721,7 +721,7 @@ YT.api = (function () {
     return {
       id: id,
       name: String(c.name || c.uploader || ''),
-      avatar: cleanAvatar(c.thumbnail || c.uploaderAvatar || '', 176),
+      avatar: cleanAvatar(c.avatarUrl || c.thumbnail || c.uploaderAvatar || '', 176),
       banner: cleanBanner(c.bannerUrl || ''),
       subs: isFinite(subs) && subs >= 0 ? subs : null,
       subsText: isFinite(subs) && subs > 0 ? YT.fmtSubs(subs) : '',
@@ -818,6 +818,8 @@ YT.api = (function () {
     const subs = Number(c.subscriberCount);
     base.subs = isFinite(subs) && subs >= 0 ? subs : base.subs;
     base.subsText = isFinite(subs) && subs > 0 ? YT.fmtSubs(subs) : base.subsText;
+    base.tabs = Array.isArray(c.tabs) ? c.tabs : [];
+    base.nextpage = c.nextpage || null;
     return base;
   }
 
@@ -995,21 +997,71 @@ YT.api = (function () {
   /* ----------------------------- channels ------------------------------- */
   api.channel = function (id) {
     return cached('channel:' + id, 30 * 60e3, async () => {
-      try {
-        const c = await api.inv('/api/v1/channels/' + encodeURIComponent(id));
-        const base = normInvChannel(c);
-        if (!base) throw new Error('No channel');
-        return base;
-      } catch (e) {
-        const path = id.charAt(0) === '@' || id.indexOf('/') === -1 && id.indexOf('UC') !== 0
-          ? '/c/' + encodeURIComponent(id.replace(/^@/, ''))
-          : '/channel/' + encodeURIComponent(id);
-        const c = await api.piped(path);
-        const base = normPipedChannelDetail(c);
-        if (!base) throw e;
-        base.latestVideos = (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
-        return base;
+      const raw = String(id || '').trim().replace(/^#/, '').replace(/^\/+/, '');
+      const clean = raw.replace(/^channel\//i, '').replace(/^c\//i, '').replace(/^user\//i, '');
+      const candidates = [];
+      if (clean.charAt(0) === '@') candidates.push(clean);
+      else if (/^UC[A-Za-z0-9_-]{20,}$/.test(clean)) candidates.push(clean);
+      else if (clean) candidates.push(clean, '@' + clean);
+      let lastErr = null;
+
+      for (const candidate of candidates) {
+        if (!candidate) continue;
+        try {
+          const c = await api.inv('/api/v1/channels/' + encodeURIComponent(candidate), { timeout: 12000 });
+          const base = normInvChannel(c);
+          if (base && base.id) return base;
+        } catch (e) { lastErr = e; }
+        try {
+          const path = candidate.charAt(0) === '@'
+            ? '/@/' + encodeURIComponent(candidate.slice(1))
+            : (/^UC[A-Za-z0-9_-]{20,}$/.test(candidate) ? '/channel/' : '/c/') + encodeURIComponent(candidate);
+          const c = await api.piped(path, { timeout: 12000 });
+          const base = normPipedChannelDetail(c);
+          if (base) {
+            base.latestVideos = (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
+            return base;
+          }
+        } catch (e) { lastErr = e; }
       }
+
+      // Public video sources sometimes reject /c and /@ but still index the
+      // channel name in search. Resolve it to a canonical UC id once.
+      const q = clean.replace(/^@/, '');
+      try {
+        const found = await api.inv('/api/v1/search?q=' + encodeURIComponent(q) + '&type=channel', { timeout: 9000 });
+        const hit = (Array.isArray(found) ? found : []).find(c => {
+          const name = String(c.author || '').toLowerCase();
+          return name === q.toLowerCase() || String(c.authorUrl || '').toLowerCase().indexOf('/' + q.toLowerCase()) > -1;
+        });
+        if (hit && hit.authorId) {
+          const c = await api.inv('/api/v1/channels/' + encodeURIComponent(hit.authorId), { timeout: 12000 });
+          const base = normInvChannel(c);
+          if (base) return base;
+        }
+      } catch (e) { lastErr = e; }
+
+      try {
+        const d = await api.piped('/search?q=' + encodeURIComponent(q) + '&filter=channels', { timeout: 9000 });
+        const hit = (d.items || []).find(x => x.type === 'channel' && String(x.name || '').toLowerCase() === q.toLowerCase());
+        const cid = hit && channelIdFromUrl(hit.url || '');
+        if (cid) {
+          try {
+            const c = await api.inv('/api/v1/channels/' + encodeURIComponent(cid), { timeout: 12000 });
+            const base = normInvChannel(c);
+            if (base) return base;
+          } catch (e) {
+            const c = await api.piped('/channel/' + encodeURIComponent(cid), { timeout: 12000 });
+            const base = normPipedChannelDetail(c);
+            if (base) {
+              base.latestVideos = (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
+              return base;
+            }
+          }
+        }
+      } catch (e) { lastErr = e; }
+
+      throw lastErr || new Error('No channel');
     });
   };
 
@@ -1036,18 +1088,27 @@ YT.api = (function () {
 
       try {
         const c = await api.piped('/channel/' + encodeURIComponent(id), { timeout: 9000 });
-        if (!c.nextpage) {
-          const videos = (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
-          if (videos.length) return { videos: videos, more: false };
-        } else {
-          const d = await api.piped('/nextpage/channel/' + encodeURIComponent(id) + '?nextpage=' + encodeURIComponent(c.nextpage), { timeout: 9000 });
-          const videos = (d.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
-          if (videos.length) return { videos: videos, more: !!d.nextpage };
+        let videos = (c.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
+        let more = !!c.nextpage;
+        if (c.nextpage) {
+          try {
+            const d = await api.piped('/nextpage/channel/' + encodeURIComponent(id) + '?nextpage=' + encodeURIComponent(c.nextpage), { timeout: 9000 });
+            const nextVideos = (d.relatedStreams || []).map(x => normPipedStream(x)).filter(Boolean);
+            if (nextVideos.length) { videos = videos.concat(nextVideos); more = !!d.nextpage; }
+          } catch (e) { /* first Piped page can still be useful */ }
         }
+        if (videos.length) return { videos: videos, more: more };
       } catch (e) { /* channel view falls back to latestVideos */ }
 
+      try {
+        const meta = await api.channel(id);
+        if (meta && meta.latestVideos && meta.latestVideos.length) {
+          return { videos: meta.latestVideos.slice(0, 60), more: false };
+        }
+      } catch (e) { /* latestVideos is also unavailable */ }
+
       // Never cache an empty first page. It would make a temporarily busy
-      // Invidious instance look like the channel has no videos for 15 minutes.
+      // instance look like the channel has no videos for 15 minutes.
       throw new Error('No channel videos');
     });
   };
@@ -1058,20 +1119,46 @@ YT.api = (function () {
       try {
         const d = await api.inv('/api/v1/channels/' + encodeURIComponent(id) + '/shorts', { timeout: 9000 });
         list = (d.videos || []).map(v => normInvVideo(v, { short: true })).filter(Boolean);
-      } catch (e) { /* try a duration-filtered search below */ }
+      } catch (e) { /* try the Piped Shorts tab below */ }
+
+      if (!list.length) {
+        try {
+          const c = await api.piped('/channel/' + encodeURIComponent(id), { timeout: 9000 });
+          const tab = (c.tabs || []).find(t => String(t.name || '').toLowerCase() === 'shorts');
+          if (tab && tab.data) {
+            const d = await api.piped('/channels/tabs?data=' + encodeURIComponent(tab.data), { timeout: 12000 });
+            const arr = d.content || d.relatedStreams || d.items || d.videos || [];
+            list = (Array.isArray(arr) ? arr : [])
+              .filter(x => x && (x.type === 'video' || x.url || x.id))
+              .map(x => normPipedStream(x, { short: true }))
+              .filter(Boolean);
+          }
+        } catch (e) { /* search fallback below */ }
+      }
 
       if (!list.length && name) {
         try {
           const arr = await api.inv('/api/v1/search?q=' + encodeURIComponent(name + ' #shorts') + '&type=video&duration=short', { timeout: 9000 });
           list = (Array.isArray(arr) ? arr : [])
-            .filter(v => v && v.authorId === id && v.lengthSeconds > 0 && v.lengthSeconds <= 180 && !v.liveNow && !v.isUpcoming)
+            .filter(v => v && (v.authorId === id || !v.authorId) && v.lengthSeconds > 0 && v.lengthSeconds <= 180 && !v.liveNow && !v.isUpcoming)
             .map(v => normInvVideo(v, { short: true }))
             .filter(Boolean);
-        } catch (e) { /* no channel shorts available */ }
+        } catch (e) { /* try Piped search below */ }
+
+        if (!list.length) {
+          try {
+            const d = await api.piped('/search?q=' + encodeURIComponent(name + ' #shorts') + '&filter=videos', { timeout: 9000 });
+            list = (d.items || [])
+              .filter(x => x && x.duration > 0 && x.duration <= 180 && !x.livestream && !x.isUpcoming)
+              .filter(x => channelIdFromUrl(x.uploaderUrl || '') === id || String(x.uploaderName || '') === name)
+              .map(x => normPipedStream(x, { short: true }))
+              .filter(Boolean);
+          } catch (e) { /* no channel shorts available */ }
+        }
       }
 
       if (!list.length) throw new Error('No Shorts');
-      return list;
+      return YT.uniqBy(list, v => v.id);
     }).catch(() => []);
   };
 
@@ -1884,7 +1971,7 @@ YT.store = (function () {
 
   function exportData() {
     return {
-      app: 'youtube-clone',
+      app: 'waveytube',
       version: 1,
       exportedAt: new Date().toISOString(),
       settings: state.settings,
@@ -2403,15 +2490,15 @@ YT.ui = (function () {
   ui.errorBox = function (message, opts) {
     const o = opts || {};
     return '<div class="error-box">' + YT.icon('warning') +
-      '<div><h3>' + YT.esc(o.title || 'Could not load YouTube data') + '</h3>' +
-      '<p>' + YT.esc(message || 'The public YouTube data services did not respond. This is usually temporary.') + '</p>' +
+      '<div><h3>' + YT.esc(o.title || 'Could not load WaveyTube data') + '</h3>' +
+      '<p>' + YT.esc(message || 'The public WaveyTube data services did not respond. This is usually temporary.') + '</p>' +
       (o.retry === false ? '' : '<button class="btn btn-sm" data-act="retry-view">' + YT.icon('refresh', 'icon icon-xs') + ' Try again</button>') +
       '</div></div>';
   };
 
   ui.staleBar = function () {
     return '<div class="stale-bar">' + YT.icon('info') +
-      '<span>Showing saved results — the live YouTube sources did not respond.</span>' +
+      '<span>Showing saved results — the live WaveyTube sources did not respond.</span>' +
       '<button data-act="retry-view">Retry</button>' +
       '</div>';
   };
@@ -2611,7 +2698,7 @@ YT.ui = (function () {
         '<input class="modal-input" readonly value="' + YT.esc('<iframe width="560" height="315" src="https://www.youtube.com/embed/' + video.id + '" allowfullscreen></iframe>') + '">' +
         '<button class="btn btn-sm" data-act="copy" data-copy="' + YT.esc('<iframe width="560" height="315" src="https://www.youtube.com/embed/' + video.id + '" allowfullscreen></iframe>') + '">Copy</button>' +
       '</div></div>' +
-      '<div class="settings-note">Videos play through YouTube. The link above opens the original video on YouTube.</div>';
+      '<div class="settings-note">Videos play through the original embed player. The link above opens the original video.</div>';
     ui.modal({ title: 'Share', body: body });
   };
 
@@ -2725,14 +2812,14 @@ YT.ui = (function () {
 
   ui.aboutModal = function () {
     ui.modal({
-      title: 'About this YouTube clone',
+      title: 'About WaveyTube',
       body:
-        '<p style="line-height:1.7">This is a browser-only YouTube front end. Search, channels, Shorts, comments and related videos come from YouTube through public <b>Piped</b> and <b>Invidious</b> instances. No API key, account or server is required.</p>' +
+        '<p style="line-height:1.7">This is a browser-only WaveyTube front end. Search, channels, Shorts, comments and related videos come from public <b>Piped</b> and <b>Invidious</b> instances. No API key, account or server is required.</p>' +
         '<div class="menu-sep"></div>' +
-        '<p style="line-height:1.7;color:var(--text-2)">Your subscriptions, likes, playlists, watch history and the recommendation model live in this browser only. Nothing is uploaded anywhere. Videos play through YouTube\'s official embed player.</p>' +
+        '<p style="line-height:1.7;color:var(--text-2)">Your subscriptions, likes, playlists, watch history and the recommendation model live in this browser only. Nothing is uploaded anywhere. Videos play through WaveyTube\'s official embed player.</p>' +
         '<div class="menu-sep"></div>' +
         '<p class="settings-note">Public instances can occasionally rate-limit requests. The app remembers the fastest working source and falls back automatically. If a panel fails, hit Retry.</p>' +
-        '<div style="margin-top:14px"><a class="btn btn-sm" href="https://www.youtube.com" target="_blank" rel="noopener">Open YouTube</a></div>'
+        '<div style="margin-top:14px"><a class="btn btn-sm" href="https://www.youtube.com" target="_blank" rel="noopener">Open source site</a></div>'
     });
   };
 
@@ -2751,7 +2838,7 @@ YT.ui = (function () {
       { icon: 'save', label: 'Save to playlist', onClick: function () { ui.saveModal(video); } },
       { type: 'sep' },
       { icon: 'share', label: 'Share', onClick: function () { ui.shareModal(video); } },
-      { icon: 'external', label: 'Open on YouTube', onClick: function () { window.open('https://www.youtube.com/watch?v=' + video.id, '_blank', 'noopener'); } },
+      { icon: 'external', label: 'Open original', onClick: function () { window.open('https://www.youtube.com/watch?v=' + video.id, '_blank', 'noopener'); } },
       { type: 'sep' },
       {
         icon: 'eye', label: 'Not interested',
@@ -2782,7 +2869,7 @@ YT.ui = (function () {
         onClick: function () { ui.toggleSubscribe(channel); }
       },
       { icon: 'share', label: 'Share channel', onClick: function () { YT.copy('https://www.youtube.com/channel/' + channel.id).then(() => YT.toast('Channel link copied')); } },
-      { icon: 'external', label: 'Open on YouTube', onClick: function () { window.open('https://www.youtube.com/channel/' + channel.id, '_blank', 'noopener'); } },
+      { icon: 'external', label: 'Open original', onClick: function () { window.open('https://www.youtube.com/channel/' + channel.id, '_blank', 'noopener'); } },
       { type: 'sep' },
       {
         icon: 'close', label: "Don't recommend channel",
@@ -2833,8 +2920,10 @@ YT.views = (function () {
   h.setMore = function (fn) { current.more = fn; };
   h.getCurrent = function () { return current; };
   h.force = function () { return forceNext; };
-  h.title = function (text) { document.title = text ? (text + ' - YouTube') : 'YouTube'; };
-  h.watchHref = id => '#/watch?v=' + encodeURIComponent(id);
+  h.title = function (text) { document.title = text ? (text + ' - WaveyTube') : 'WaveyTube'; };
+  h.watchHref = function (id, list) {
+    return '#/watch?v=' + encodeURIComponent(id) + (list ? '&list=' + encodeURIComponent(list) : '');
+  };
   h.shortHref = id => '#/shorts/' + encodeURIComponent(id);
   h.channelHref = ch => (ch && ch.id ? '#/channel/' + encodeURIComponent(ch.id) : '#/results?search_query=' + encodeURIComponent((ch && ch.name) || ''));
   h.playlistHref = id => '#/playlist?list=' + encodeURIComponent(id);
@@ -2956,7 +3045,7 @@ YT.views = (function () {
     }
     if (YT.player) YT.player.destroy();
     if (YT.ui) YT.ui.closeMenu();
-    document.title = 'YouTube';
+    document.title = 'WaveyTube';
     if (YT.app && YT.app.setLoading) YT.app.setLoading(true);
     const view = views[name];
     if (!view) {
@@ -3049,7 +3138,7 @@ YT.views = (function () {
     } catch (err) {
       if (!h.alive(token)) return;
       h.setPage('<div class="page-inner">' + homeChips(cat) +
-        YT.ui.errorBox('The YouTube data services did not respond. Public instances occasionally rate-limit; try again in a moment.') + '</div>');
+        YT.ui.errorBox('The WaveyTube data services did not respond. Public instances occasionally rate-limit; try again in a moment.') + '</div>');
       return;
     }
     if (!h.alive(token)) return;
@@ -3205,11 +3294,11 @@ YT.views = (function () {
 
     if (!q) {
       const recent = YT.store.state.searches.slice(0, 10);
-      h.setPage('<div class="search-page">' + h.pageHead('Search YouTube') +
+      h.setPage('<div class="search-page">' + h.pageHead('Search WaveyTube') +
         (recent.length
           ? '<div class="chips" style="flex-wrap:wrap;margin-bottom:20px">' + recent.map(s =>
             '<a class="chip" href="' + h.searchHref(s.q) + '">' + YT.icon('history', 'icon icon-xs') + YT.esc(s.q) + '</a>').join('') + '</div>'
-          : h.empty('search', 'Search YouTube', 'Find videos, channels and Shorts from all of YouTube.')) +
+          : h.empty('search', 'Search WaveyTube', 'Find videos, channels and Shorts from all of WaveyTube.')) +
         '</div>');
       return;
     }
@@ -3359,7 +3448,7 @@ YT.views = (function () {
       }
     } catch (err) {
       if (!h.alive(token)) return;
-      YT.$('#searchBody').innerHTML = YT.ui.errorBox('Search could not reach YouTube. Public data instances can be briefly rate-limited.');
+      YT.$('#searchBody').innerHTML = YT.ui.errorBox('Search could not reach WaveyTube. Public data instances can be briefly rate-limited.');
     }
   };
 
@@ -3377,7 +3466,7 @@ YT.views = (function () {
   return publicApi;
 })();
 /* =========================================================================
-   05b · PLAYER + WATCH — official YouTube embed, click to play, resume,
+   05b · PLAYER + WATCH — official WaveyTube embed, click to play, resume,
    comments, replies, related videos and autoplay-next.
    ========================================================================= */
 'use strict';
@@ -3406,11 +3495,11 @@ YT.player = (function () {
       const script = document.createElement('script');
       script.src = 'https://www.youtube.com/iframe_api';
       script.async = true;
-      script.onerror = function () { reject(new Error('YouTube player failed to load')); };
+      script.onerror = function () { reject(new Error('WaveyTube player failed to load')); };
       document.head.appendChild(script);
       setTimeout(function () {
         if (window.YT && window.YT.Player) resolve(window.YT);
-        else reject(new Error('YouTube player timed out'));
+        else reject(new Error('WaveyTube player timed out'));
       }, 9000);
     });
     return apiPromise;
@@ -3434,7 +3523,7 @@ YT.player = (function () {
     iframe.src = 'https://www.youtube.com/embed/' + encodeURIComponent(current.id) +
       '?autoplay=1&playsinline=1&rel=0&enablejsapi=0&start=' + Math.floor(start) +
       (opts.loop ? '&loop=1&playlist=' + encodeURIComponent(current.id) : '');
-    iframe.title = 'YouTube video player';
+    iframe.title = 'WaveyTube video player';
     iframe.allow = 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share';
     iframe.allowFullscreen = true;
     iframe.frameBorder = '0';
@@ -3641,7 +3730,7 @@ YT.player = (function () {
   let state = {
     id: '', video: null, resume: 0, started: false, recorded: false,
     related: [], commentsToken: null, commentCount: 0, commentLikes: new Set(),
-    countdown: null, nextVideo: null
+    countdown: null, nextVideo: null, playlist: null, playlistId: '', queueIndex: -1
   };
 
   function playerShell(id) {
@@ -3711,7 +3800,7 @@ YT.player = (function () {
           '</a>' +
           '<div class="channel-bar-info">' +
             '<a class="channel-bar-name" href="' + h.channelHref(ch) + '"><span class="name">' + YT.esc(ch.name || 'Unknown channel') + '</span>' + h.verified(ch) + '</a>' +
-            '<div class="channel-bar-subs">' + YT.esc(v.subs ? YT.fmtSubs(v.subs) : (sub ? YT.fmtSubs(sub.subs) : 'YouTube channel')) + '</div>' +
+            '<div class="channel-bar-subs">' + YT.esc(v.subs ? YT.fmtSubs(v.subs) : (sub ? YT.fmtSubs(sub.subs) : 'WaveyTube channel')) + '</div>' +
           '</div>' +
           '<div class="subscribe-group">' +
             YT.ui.subscribeButton(ch) +
@@ -3764,6 +3853,88 @@ YT.player = (function () {
     mount.innerHTML = YT.ui.compactList(plain) +
       (shorts.length ? '<div class="related-shorts"><h3>' + YT.icon('shorts-fill') + 'Shorts</h3>' +
         '<div class="related-shorts-grid">' + shorts.map(s => YT.ui.shortCard(s)).join('') + '</div></div>' : '');
+  }
+
+
+  function renderQueue() {
+    const mount = YT.$('#relatedList');
+    if (!mount || !state.playlist) return;
+    const pl = state.playlist;
+    const total = pl.videos.length;
+    const start = pl.index;
+    const rows = pl.videos.slice(start).map(function (v, offset) {
+      const i = start + offset;
+      if (!v || !v.id) return '';
+      YT.ui.rememberVideo(v);
+      if (v.channel) YT.ui.rememberChannel(v.channel);
+      const isCurrent = i === start;
+      const isNext = i === start + 1;
+      const tag = isCurrent
+        ? '<span class="queue-tag now">Now playing</span>'
+        : isNext ? '<span class="queue-tag next">Up next</span>' : '';
+      const badge = v.duration > 0 && v.duration < 86400
+        ? '<span class="badge duration">' + YT.esc(YT.fmtDuration(v.duration)) + '</span>' : '';
+      const thumb = '<span class="compact-thumb"><img ' + YT.thumbAttrs(v.id, { small: true }) +
+        ' alt="" loading="lazy" decoding="async">' + badge + '</span>';
+      const info = '<span class="compact-info"><span class="compact-title">' + YT.esc(v.title || 'Untitled') + '</span>' +
+        '<span class="compact-channel">' + YT.esc((v.channel && v.channel.name) || '') + '</span>' + tag + '</span>';
+      const attrs = ' data-video-id="' + YT.esc(v.id) + '"';
+      if (isCurrent) return '<div class="compact queue-row is-current"' + attrs + '>' + thumb + info + '</div>';
+      return '<a class="compact queue-row" href="' + h.watchHref(v.id, pl.id) + '"' + attrs + '>' + thumb + info + '</a>';
+    }).join('');
+    const countText = total ? (start + 1) + ' / ' + total + (total === 1 ? ' video' : ' videos') : '';
+    const authorText = pl.author ? ' · ' + YT.esc(pl.author) : '';
+    mount.innerHTML = '<div class="queue-panel">' +
+      '<a class="queue-playlist" href="' + h.playlistHref(pl.id) + '">' +
+        '<div class="queue-playlist-label">Playlist</div>' +
+        '<div class="queue-playlist-title">' + YT.esc(pl.title || 'Playlist') + '</div>' +
+        '<div class="queue-playlist-meta">' + YT.esc(countText) + authorText + '</div>' +
+      '</a>' +
+      '<div class="queue-list">' + (rows || '<div class="queue-empty">This playlist is empty.</div>') + '</div>' +
+      (start >= total - 1 ? '<div class="queue-empty">End of playlist</div>' : '') +
+    '</div>';
+  }
+
+  async function loadQueue(listId, currentId, token) {
+    try {
+      let title = 'Playlist';
+      let author = '';
+      let videos = [];
+      if (listId.indexOf('local_') === 0) {
+        const pl = YT.store.getPlaylist(listId);
+        if (!pl) throw new Error('Playlist not found');
+        title = pl.name || title;
+        author = 'Your playlist';
+        videos = (pl.videos || []).slice();
+      } else if (listId === 'WL') {
+        title = 'Watch later';
+        author = 'Your library';
+        videos = YT.store.state.later.slice();
+      } else if (listId === 'LL') {
+        title = 'Liked videos';
+        author = 'Your library';
+        videos = YT.store.state.likes.slice();
+      } else {
+        const data = await YT.api.playlist(listId);
+        title = data.title || title;
+        author = data.author || '';
+        videos = (data.videos || []).slice();
+      }
+      if (!h.alive(token)) return false;
+      videos = videos.filter(v => v && v.id);
+      let index = videos.findIndex(v => v.id === currentId);
+      if (index < 0) {
+        videos.unshift(state.video && state.video.id === currentId ? state.video : { id: currentId, title: '', channel: {} });
+        index = 0;
+      }
+      state.playlist = { id: listId, title: title, author: author, videos: videos, index: index };
+      state.queueIndex = index;
+      state.nextVideo = videos[index + 1] || null;
+      renderQueue();
+      return true;
+    } catch (e) {
+      return false;
+    }
   }
 
   function commentHtml(c, videoId) {
@@ -3823,7 +3994,7 @@ YT.player = (function () {
     } catch (e) {
       if (!h.alive(token) || !mount.isConnected) return;
       mount.innerHTML = '<div class="comments" id="comments"><div class="comments-head"><h2>Comments</h2></div>' +
-        YT.ui.errorBox('Comments could not be loaded from YouTube right now.', { retry: false }) + '</div>';
+        YT.ui.errorBox('Comments could not be loaded right now.', { retry: false }) + '</div>';
     }
   }
 
@@ -3837,7 +4008,7 @@ YT.player = (function () {
           : 'The video could not be played in this browser.';
     shell.innerHTML = '<div class="player-error">' + YT.icon('warning', 'icon icon-lg') +
       '<h3>Playback error</h3><p>' + YT.esc(reason) + '</p>' +
-      '<a class="btn" href="https://www.youtube.com/watch?v=' + encodeURIComponent(state.id) + '" target="_blank" rel="noopener">Watch on YouTube</a>' +
+      '<a class="btn" href="https://www.youtube.com/watch?v=' + encodeURIComponent(state.id) + '" target="_blank" rel="noopener">Open original video</a>' +
       '</div>';
   }
 
@@ -3881,7 +4052,22 @@ YT.player = (function () {
     const duration = YT.player.getDuration() || (state.video && state.video.duration) || 0;
     if (duration) YT.store.updateProgress(state.id, duration, duration);
     if (!YT.store.state.settings.autoplay) return;
-    const next = state.related.filter(v => !v.isShort)[0] || state.related[0];
+    let next = null;
+    if (state.playlist) {
+      const pl = state.playlist;
+      const currentIndex = pl.videos.findIndex(v => v.id === state.id);
+      const nextIndex = currentIndex > -1 ? currentIndex + 1 : pl.index + 1;
+      if (nextIndex >= pl.videos.length) {
+        clearNext();
+        YT.toast('End of playlist');
+        return;
+      }
+      pl.index = nextIndex;
+      state.queueIndex = nextIndex;
+      next = pl.videos[nextIndex];
+    } else {
+      next = state.related.filter(v => !v.isShort)[0] || state.related[0];
+    }
     if (!next) return;
     state.nextVideo = next;
     const shell = YT.$('#playerShell');
@@ -3890,8 +4076,9 @@ YT.player = (function () {
     const overlay = document.createElement('div');
     overlay.className = 'next-overlay';
     overlay.id = 'nextOverlay';
-    overlay.innerHTML = '<div class="next-label">Up next in <span id="nextSec">5</span>s</div>' +
-      '<a class="next-card" href="' + h.watchHref(next.id) + '">' +
+    overlay.innerHTML = '<div class="next-label">' + (state.playlist ? 'Next in playlist' : 'Up next') +
+      ' in <span id="nextSec">5</span>s</div>' +
+      '<a class="next-card" href="' + h.watchHref(next.id, state.playlist ? state.playlist.id : '') + '">' +
         '<img ' + YT.thumbAttrs(next.id, { small: true }) + ' alt="">' +
         '<div class="next-info"><div class="next-title">' + YT.esc(next.title) + '</div>' +
         '<div class="next-meta">' + YT.esc(next.channel && next.channel.name || '') + '</div></div>' +
@@ -3906,7 +4093,7 @@ YT.player = (function () {
       if (el) el.textContent = String(Math.max(0, seconds));
       if (seconds <= 0) {
         clearNext();
-        location.hash = h.watchHref(next.id).slice(1);
+        location.hash = h.watchHref(next.id, state.playlist ? state.playlist.id : '').slice(1);
       }
     }, 1000);
   }
@@ -4018,7 +4205,7 @@ YT.player = (function () {
     if (act === 'play-next') {
       const next = state.nextVideo;
       clearNext();
-      if (next) location.hash = h.watchHref(next.id).slice(1);
+      if (next) location.hash = h.watchHref(next.id, state.playlist ? state.playlist.id : '').slice(1);
       return true;
     }
     if (act === 'cancel-next') { clearNext(); return true; }
@@ -4031,6 +4218,7 @@ YT.player = (function () {
 
   views.watch = async function (params, token, opts) {
     const id = String(params.get('v') || '').trim();
+    const listId = String(params.get('list') || '').trim();
     if (!id) { h.setPage(h.notFound()); return; }
     const time = Number(params.get('t')) || 0;
     const hist = YT.store.state.history.find(x => x.id === id);
@@ -4038,7 +4226,7 @@ YT.player = (function () {
     state = {
       id: id, video: null, resume: resume > 8 && resume < 86400 ? resume : 0, started: false, recorded: false,
       related: [], commentsToken: null, commentCount: 0, commentLikes: new Set(),
-      countdown: null, nextVideo: null
+      countdown: null, nextVideo: null, playlist: null, playlistId: listId, queueIndex: -1
     };
     h.title('Video');
     h.setPage(shell(id));
@@ -4048,13 +4236,34 @@ YT.player = (function () {
     // the embedded player. The player falls back to muted playback if the
     // browser blocks unmuted autoplay.
     startPlayback();
+    const queuePromise = listId ? loadQueue(listId, id, token) : Promise.resolve(false);
 
     try {
       const video = await YT.api.video(id);
       if (!h.alive(token)) return;
       state.video = video;
+      if (state.playlist) {
+        const idx = state.playlist.videos.findIndex(v => v.id === id);
+        if (idx > -1) {
+          const existing = state.playlist.videos[idx];
+          if (!existing.title || !existing.channel || !existing.channel.name) {
+            state.playlist.videos[idx] = Object.assign({}, existing, video, {
+              channel: (video.channel && video.channel.name) ? video.channel : existing.channel
+            });
+          }
+          state.playlist.index = idx;
+          state.queueIndex = idx;
+          state.nextVideo = state.playlist.videos[idx + 1] || null;
+          renderQueue();
+        }
+      } else if (listId) {
+        queuePromise.then(function (ok) {
+          if (h.alive(token) && !ok && !state.playlist) renderRelated(video);
+        });
+      } else {
+        renderRelated(video);
+      }
       renderMeta(video);
-      renderRelated(video);
       loadComments(id, token);
     } catch (err) {
       if (!h.alive(token)) return;
@@ -4152,7 +4361,7 @@ YT.player = (function () {
         frame.dataset.playing = '0';
         activeShortId = '';
         frame.innerHTML = '<div class="player-error"><p>This Short cannot be played here.</p>' +
-          '<a class="btn" href="https://www.youtube.com/shorts/' + encodeURIComponent(id) + '" target="_blank" rel="noopener">Open on YouTube</a></div>';
+          '<a class="btn" href="https://www.youtube.com/shorts/' + encodeURIComponent(id) + '" target="_blank" rel="noopener">Open original</a></div>';
       }
     });
   }
@@ -4330,7 +4539,7 @@ YT.player = (function () {
     list = YT.uniqBy(list, v => v.id);
     if (!list.length) {
       h.setPage('<div class="shorts-page"><div class="short-empty">' + YT.icon('warning', 'icon icon-lg') +
-        '<h2>Shorts are unavailable</h2><p>The YouTube sources did not return Shorts. Try again in a moment.</p>' +
+        '<h2>Shorts are unavailable</h2><p>The video sources did not return Shorts. Try again in a moment.</p>' +
         '<button class="btn btn-filled" data-act="retry-view">Retry</button></div></div>');
       return;
     }
@@ -4369,7 +4578,7 @@ YT.player = (function () {
         '</a>' +
         '<div class="channel-head-info">' +
           '<h1 class="channel-head-name">' + YT.esc(ch.name) + h.verified(ch) + '</h1>' +
-          '<div class="channel-head-meta">' + YT.esc(ch.subsText || 'YouTube channel') +
+          '<div class="channel-head-meta">' + YT.esc(ch.subsText || 'WaveyTube channel') +
             (ch.latestVideos && ch.latestVideos.length ? '<span class="dot">•</span>' + ch.latestVideos.length + '+ videos' : '') +
           '</div>' +
           (ch.description ? '<div class="channel-head-desc">' + YT.esc(ch.description) + '</div>' : '') +
@@ -4399,8 +4608,8 @@ YT.player = (function () {
         '<div class="about-stat">' + YT.icon('bell') + '<div><div>' + YT.esc(ch.subsText || '—') + '</div><div class="settings-note">Subscribers</div></div></div>' +
         (ch.totalViews ? '<div class="about-stat">' + YT.icon('eye') + '<div><div>' + YT.esc(YT.fmtNum(ch.totalViews)) + ' views</div><div class="settings-note">Total channel views</div></div></div>' : '') +
         (joined ? '<div class="about-stat">' + YT.icon('calendar') + '<div><div>Joined ' + YT.esc(YT.fmtDate(joined)) + '</div><div class="settings-note">Channel creation date</div></div></div>' : '') +
-        '<div class="about-stat">' + YT.icon('link') + '<div><a class="about-link" href="https://www.youtube.com/channel/' + encodeURIComponent(ch.id) + '" target="_blank" rel="noopener">youtube.com/channel/' + YT.esc(ch.id) + '</a></div></div>' +
-        '<div class="about-stat">' + YT.icon('info') + '<div class="settings-note">Channel data comes from YouTube through public Piped / Invidious instances.</div></div>' +
+        '<div class="about-stat">' + YT.icon('link') + '<div><a class="about-link" href="https://www.youtube.com/channel/' + encodeURIComponent(ch.id) + '" target="_blank" rel="noopener">Open original channel</a></div></div>' +
+        '<div class="about-stat">' + YT.icon('info') + '<div class="settings-note">Channel data comes from public Piped / Invidious instances.</div></div>' +
       '</div></div>';
   }
 
@@ -4470,7 +4679,7 @@ YT.player = (function () {
     try { ch = await YT.api.channel(id); }
     catch (e) {
       if (!h.alive(token)) return;
-      h.setPage('<div class="page-inner">' + YT.ui.errorBox('This channel could not be loaded. It may not exist, or the public YouTube data source is busy.') + '</div>');
+      h.setPage('<div class="page-inner">' + YT.ui.errorBox('This channel could not be loaded. It may not exist, or the public video data source is busy.') + '</div>');
       return;
     }
     if (!h.alive(token)) return;
@@ -4598,11 +4807,11 @@ YT.player = (function () {
       YT.ui.rememberVideo(v);
       return '<div class="lib-row playlist-row" data-video-id="' + YT.esc(v.id) + '">' +
         '<span class="pl-index">' + (i + 1) + '</span>' +
-        '<a class="lib-thumb" href="' + h.watchHref(v.id) + '">' +
+        '<a class="lib-thumb" href="' + h.watchHref(v.id, playlistId) + '">' +
           '<img ' + YT.thumbAttrs(v.id, { small: true }) + ' alt="">' + h.badge(v) +
         '</a>' +
         '<div class="lib-info">' +
-          '<a class="lib-title" href="' + h.watchHref(v.id) + '">' + YT.esc(v.title) + '</a>' +
+          '<a class="lib-title" href="' + h.watchHref(v.id, playlistId) + '">' + YT.esc(v.title) + '</a>' +
           '<div class="lib-meta">' + (v.channel && v.channel.name ? YT.esc(v.channel.name) : '') + ' ' + h.metaLine(v) + '</div>' +
         '</div>' +
         '<button class="card-menu" data-act="lib-menu" data-id="' + YT.esc(v.id) + '" data-kind="playlist" data-pl="' + YT.esc(playlistId) + '" aria-label="Action menu">' + YT.icon('more') + '</button>' +
@@ -4629,7 +4838,7 @@ YT.player = (function () {
     if (!h.alive(token)) return;
     h.title(data.title);
     for (const v of data.videos) {
-      if (!v.channel.name) v.channel.name = data.author || 'YouTube';
+      if (!v.channel.name) v.channel.name = data.author || 'WaveyTube';
       if (!v.channel.id) v.channel.id = data.authorId || '';
     }
     const cover = data.thumb
@@ -4640,18 +4849,18 @@ YT.player = (function () {
       title: data.title,
       meta: YT.esc(data.author || '') + (data.count ? ' <span class="dot">•</span> ' + data.count + ' videos' : '') +
         (data.description ? '<div class="lib-desc" style="display:block;margin-top:8px">' + YT.esc(data.description.slice(0, 220)) + '</div>' : ''),
-      actions: (data.videos.length ? '<button class="btn btn-filled" data-act="play-all" data-id="' + YT.esc(data.videos[0].id) + '">' + YT.icon('play', 'icon icon-sm') + 'Play all</button>' : '') +
+      actions: (data.videos.length ? '<button class="btn btn-filled" data-act="play-all" data-id="' + YT.esc(data.videos[0].id) + '" data-list="' + YT.esc(id) + '">' + YT.icon('play', 'icon icon-sm') + 'Play all</button>' : '') +
         '<button class="btn" data-act="save-playlist" data-id="' + YT.esc(id) + '">' + YT.icon('save', 'icon icon-sm') + 'Save playlist</button>' +
         '<button class="btn" data-act="share-playlist" data-id="' + YT.esc(id) + '">' + YT.icon('share', 'icon icon-sm') + 'Share</button>'
     }) +
       (data.videos.length
         ? numberedPlaylistRows(data.videos, id)
-        : YT.ui.errorBox(data.incomplete ? 'The videos in this playlist could not be read. Open it on YouTube to watch.' : 'This playlist is empty.', { retry: false })) +
+        : YT.ui.errorBox(data.incomplete ? 'The videos in this playlist could not be read. Open the source playlist to watch.' : 'This playlist is empty.', { retry: false })) +
       '</div>');
 
     h.setAction(function (act, ds, el) {
       if (act === 'play-all' && ds.id) {
-        location.hash = h.watchHref(ds.id).slice(1);
+        location.hash = h.watchHref(ds.id, ds.list).slice(1);
         return true;
       }
       if (act === 'save-playlist') {
@@ -4686,7 +4895,7 @@ YT.player = (function () {
       cover: cover,
       title: pl.name,
       meta: pl.videos.length + ' videos <span class="dot">•</span> Saved in this browser',
-      actions: (pl.videos.length ? '<button class="btn btn-filled" data-act="play-all" data-id="' + YT.esc(pl.videos[0].id) + '">' + YT.icon('play', 'icon icon-sm') + 'Play all</button>' : '') +
+      actions: (pl.videos.length ? '<button class="btn btn-filled" data-act="play-all" data-id="' + YT.esc(pl.videos[0].id) + '" data-list="' + YT.esc(pl.id) + '">' + YT.icon('play', 'icon icon-sm') + 'Play all</button>' : '') +
         '<button class="btn" data-act="rename-loop" data-pl="' + YT.esc(pl.id) + '">' + YT.icon('edit', 'icon icon-sm') + 'Rename</button>' +
         '<button class="btn btn-danger" data-act="delete-local-pl" data-pl="' + YT.esc(pl.id) + '">' + YT.icon('trash', 'icon icon-sm') + 'Delete</button>'
     }) +
@@ -4694,7 +4903,7 @@ YT.player = (function () {
 
     h.setAction(function (act, ds, el) {
       if (act === 'play-all' && ds.id) {
-        location.hash = h.watchHref(ds.id).slice(1);
+        location.hash = h.watchHref(ds.id, ds.list).slice(1);
         return true;
       }
       if (act === 'lib-menu') {
@@ -4754,7 +4963,7 @@ YT.player = (function () {
     items.push({ icon: 'save', label: 'Save to playlist', onClick: function () { YT.ui.saveModal(v); } });
     items.push({ type: 'sep' });
     items.push({ icon: 'share', label: 'Share', onClick: function () { YT.ui.shareModal(v); } });
-    items.push({ icon: 'external', label: 'Open on YouTube', onClick: function () { window.open('https://www.youtube.com/watch?v=' + v.id, '_blank', 'noopener'); } });
+    items.push({ icon: 'external', label: 'Open original', onClick: function () { window.open('https://www.youtube.com/watch?v=' + v.id, '_blank', 'noopener'); } });
     YT.ui.menu(anchor, items);
   }
 
@@ -4817,7 +5026,7 @@ YT.player = (function () {
         return true;
       }
       if (act === 'play-all' && ds.id) {
-        location.hash = h.watchHref(ds.id).slice(1);
+        location.hash = h.watchHref(ds.id, ds.list).slice(1);
         return true;
       }
       if (act === 'toggle-history-pause') {
@@ -5030,8 +5239,8 @@ YT.player = (function () {
       '<button class="' + (theme === t[0] ? 'active' : '') + '" data-act="set-theme" data-value="' + t[0] + '">' + t[1] + '</button>').join('');
     h.setPage('<div class="settings-page"><h1>Settings</h1>' +
 
-      '<div class="set-group"><h2>Appearance</h2><p>Choose how this YouTube clone looks on this device.</p>' +
-        '<div class="set-row"><div class="set-row-text"><div class="set-label">Theme</div><div class="set-desc">Dark follows YouTube\'s default look.</div></div>' +
+      '<div class="set-group"><h2>Appearance</h2><p>Choose how this WaveyTube clone looks on this device.</p>' +
+        '<div class="set-row"><div class="set-row-text"><div class="set-label">Theme</div><div class="set-desc">Dark follows WaveyTube\'s default look.</div></div>' +
         '<div class="segmented">' + seg + '</div></div></div>' +
 
       '<div class="set-group"><h2>Playback</h2>' +
@@ -5066,14 +5275,14 @@ YT.player = (function () {
           '<button class="btn btn-sm btn-danger" data-act="settings-clear-all">Delete</button></div>' +
       '</div>' +
 
-      '<div class="set-group"><h2>About</h2><p>Search, channels, Shorts and comments are real YouTube data fetched through public Piped and Invidious instances. No API key, account or server is used.</p>' +
+      '<div class="set-group"><h2>About</h2><p>Search, channels, Shorts and comments use public video data fetched through Piped and Invidious instances. No API key, account or server is used.</p>' +
         '<div class="set-row"><div class="set-row-text"><div class="set-label">Keyboard shortcuts</div><div class="set-desc">Playback and search shortcuts.</div></div>' +
           '<button class="btn btn-sm" data-act="settings-shortcuts">View</button></div>' +
         '<div class="set-row"><div class="set-row-text"><div class="set-label">About this clone</div><div class="set-desc">How the data and recommendations work.</div></div>' +
           '<button class="btn btn-sm" data-act="settings-about">Read</button></div>' +
       '</div>' +
 
-      '<p class="settings-note">Videos are embedded from YouTube. This site is not affiliated with YouTube.</p>' +
+      '<p class="settings-note">Videos are embedded from the original source. WaveyTube is not affiliated with the source platform.</p>' +
       '<input type="file" id="importFile" accept="application/json,.json" hidden>' +
       '</div>');
 
@@ -5106,7 +5315,7 @@ YT.player = (function () {
         YT.store.clearSearches(); YT.toast('Search history cleared'); YT.views.refresh(); return true;
       }
       if (act === 'settings-export') {
-        YT.download('youtube-clone-data.json', JSON.stringify(YT.store.exportData(), null, 2));
+        YT.download('waveytube-data.json', JSON.stringify(YT.store.exportData(), null, 2));
         YT.toast('Backup downloaded');
         return true;
       }
@@ -5297,7 +5506,7 @@ YT.app = (function () {
       '</div>';
 
     html += '<div class="side-group">' +
-      '<div class="side-heading">More from YouTube</div>' +
+      '<div class="side-heading">More from WaveyTube</div>' +
       sideItem('settings', '#/settings', 'settings', 'Settings') +
       '<button class="side-item" data-act="about">' + YT.icon('info', 'side-icon icon') + '<span class="side-label">About this clone</span></button>' +
       '<button class="side-item" data-act="shortcuts">' + YT.icon('keyboard', 'side-icon icon') + '<span class="side-label">Keyboard shortcuts</span></button>' +
@@ -5318,7 +5527,7 @@ YT.app = (function () {
     html += '<div class="side-footer">' +
       '<a href="#/settings">Settings</a><a href="#/settings">Data &amp; privacy</a>' +
       '<a href="#" data-act="about">About</a>' +
-      '<div class="copyright">© 2026 YouTube clone<br>Real YouTube data · local recommendations</div>' +
+      '<div class="copyright">© 2026 WaveyTube<br>Public video data · local recommendations</div>' +
       '</div>';
 
     nav.innerHTML = html;
@@ -5560,8 +5769,8 @@ YT.app = (function () {
     YT.ui.menu(anchor, [
       { icon: 'playlist', label: 'Create playlist', onClick: function () { YT.ui.newPlaylistModal(); } },
       { type: 'sep' },
-      { icon: 'upload', label: 'Upload video', onClick: function () { YT.toast('Uploads need a YouTube account. This clone is for watching and learning.'); } },
-      { icon: 'live', label: 'Go live', onClick: function () { YT.toast('Going live needs a YouTube account.'); } }
+      { icon: 'upload', label: 'Upload video', onClick: function () { YT.toast('Uploads are not available in WaveyTube.'); } },
+      { icon: 'live', label: 'Go live', onClick: function () { YT.toast('Going live is not available in WaveyTube.'); } }
     ]);
   }
 
