@@ -1734,3 +1734,4 @@ body.guide-collapsed .page { transition: margin-left .15s ease; }
 
 /* clickable Shorts poster */
 .short-frame[data-playing="0"] { cursor: pointer; }
+
