@@ -2247,7 +2247,10 @@ YT.ui = (function () {
           '</a>' +
           '<div class="card-stats">' + metaLine(video) + '</div>' +
         '</div>' +
-        (o.showMenu === false ? '' : '<button class="card-menu" data-act="video-menu" data-id="' + YT.esc(video.id) + '" aria-label="Action menu" title="Action menu">' + YT.icon('more') + '</button>') +
+        (o.showMenu === false ? '' : '<div class="card-actions">' +
+          '<button class="card-menu" data-act="video-save" data-id="' + YT.esc(video.id) + '" aria-label="Save to playlist" title="Save to playlist">' + YT.icon('save') + '</button>' +
+          '<button class="card-menu" data-act="video-menu" data-id="' + YT.esc(video.id) + '" aria-label="Action menu" title="Action menu">' + YT.icon('more') + '</button>' +
+        '</div>') +
       '</div>' +
     '</article>';
   };
@@ -2634,7 +2637,8 @@ YT.ui = (function () {
       body: '<div class="playlist-pick">' + rows.join('') + '</div>' +
         '<div class="menu-sep"></div>' +
         '<button class="pick-row" data-act="new-playlist" data-id="' + YT.esc(video.id) + '">' +
-        '<span class="pick-icon">' + YT.icon('plus') + '</span><span class="pick-label">New playlist</span></button>'
+        '<span class="pick-icon">' + YT.icon('plus') + '</span><span class="pick-label">New playlist</span></button>' +
+        '<div class="settings-note" style="margin-top:12px">Playlists are stored in this browser - no account needed.</div>'
     });
   };
 
@@ -3385,6 +3389,7 @@ YT.player = (function () {
   let player = null;
   let current = null;
   let timer = null;
+  let autoplayTimer = null;
   let loadToken = 0;
 
   function loadApi() {
@@ -3413,6 +3418,7 @@ YT.player = (function () {
 
   function cleanup() {
     if (timer) { clearInterval(timer); timer = null; }
+    if (autoplayTimer) { clearTimeout(autoplayTimer); autoplayTimer = null; }
     try { if (player && typeof player.destroy === 'function') player.destroy(); } catch (e) {}
     player = null;
     if (current && current.container) current.container.innerHTML = '';
@@ -3442,6 +3448,51 @@ YT.player = (function () {
     }, 15000);
   }
 
+  function showSoundHint(container, targetPlayer) {
+    if (!container || !targetPlayer || container.querySelector('.player-sound-hint')) return;
+    const hint = document.createElement('button');
+    hint.type = 'button';
+    hint.className = 'player-sound-hint';
+    hint.innerHTML = YT.icon('volume') + '<span>Tap to unmute</span>';
+    hint.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        targetPlayer.unMute();
+        targetPlayer.setVolume(100);
+        targetPlayer.playVideo();
+      } catch (err) {}
+      hint.remove();
+    });
+    container.appendChild(hint);
+  }
+
+  function scheduleAutoplayCheck(targetPlayer, container, token, o) {
+    if (autoplayTimer) { clearTimeout(autoplayTimer); autoplayTimer = null; }
+    if (o.autoplay === false) return;
+    autoplayTimer = setTimeout(function () {
+      autoplayTimer = null;
+      if (!player || token !== loadToken || !container || !container.isConnected) return;
+      let playing = false;
+      try {
+        const state = targetPlayer.getPlayerState();
+        playing = state === 1 || state === 3;
+      } catch (err) {}
+      if (!playing) {
+        // Browsers may reject unmuted autoplay. Muting preserves playback and
+        // gives the viewer a one-tap way to restore sound.
+        try { targetPlayer.mute(); } catch (err) {}
+        try { targetPlayer.playVideo(); } catch (err) {}
+        if (o.onAutoplayBlocked) { try { o.onAutoplayBlocked(); } catch (err) {} }
+        if (o.showAutoplayHint !== false) showSoundHint(container, targetPlayer);
+        return;
+      }
+      let muted = false;
+      try { muted = !!(targetPlayer.isMuted && targetPlayer.isMuted()); } catch (err) {}
+      if (muted && o.showAutoplayHint !== false) showSoundHint(container, targetPlayer);
+    }, 1400);
+  }
+
   function load(id, opts) {
     cleanup();
     loadToken++;
@@ -3467,6 +3518,7 @@ YT.player = (function () {
         iv_load_policy: 3,
         color: 'white'
       };
+      if (o.muted) playerVars.mute = 1;
       if (o.loop) {
         playerVars.loop = 1;
         playerVars.playlist = id;
@@ -3482,7 +3534,9 @@ YT.player = (function () {
             if (token !== loadToken) return;
             const spinner = o.container.querySelector('.player-spinner');
             if (spinner) spinner.remove();
+            if (o.muted) { try { event.target.mute(); } catch (e) {} }
             try { event.target.playVideo(); } catch (e) {}
+            scheduleAutoplayCheck(event.target, o.container, token, o);
           },
           onStateChange: function (event) {
             if (token !== loadToken) return;
@@ -3509,6 +3563,7 @@ YT.player = (function () {
           },
           onError: function (event) {
             if (token !== loadToken) return;
+            if (autoplayTimer) { clearTimeout(autoplayTimer); autoplayTimer = null; }
             if (o.onError) o.onError(event.data || 0);
           }
         }
@@ -3540,10 +3595,19 @@ YT.player = (function () {
   function mute(force) {
     if (!player) return;
     try {
-      if (force === false) player.unMute();
-      else if (force === true) player.mute();
-      else if (player.isMuted && player.isMuted()) player.unMute();
-      else player.mute();
+      if (force === false) {
+        player.unMute();
+        if (current && current.container) {
+          const hint = current.container.querySelector('.player-sound-hint');
+          if (hint) hint.remove();
+        }
+      } else if (force === true) {
+        player.mute();
+      } else if (player.isMuted && player.isMuted()) {
+        player.unMute();
+      } else {
+        player.mute();
+      }
     } catch (e) {}
   }
 
@@ -3790,7 +3854,7 @@ YT.player = (function () {
 
   function startPlayback() {
     const shell = YT.$('#playerShell');
-    if (!shell) return;
+    if (!shell || state.started) return;
     const start = state.resume || 0;
     state.started = true;
     recordWatch(state.video, start);
@@ -3800,12 +3864,6 @@ YT.player = (function () {
       start: start,
       onPlay: function () {
         if (state.video) recordWatch(state.video);
-        else {
-          YT.api.video(state.id).then(v => {
-            if (!state.video) { state.video = v; renderMeta(v); renderRelated(v); }
-            recordWatch(v);
-          }).catch(() => recordWatch(null));
-        }
       },
       onProgress: function (t, d) { YT.store.updateProgress(state.id, t, d); },
       onEnded: onEnded,
@@ -3986,6 +4044,10 @@ YT.player = (function () {
     h.setPage(shell(id));
     h.setAction(action);
     h.setCleanup(function () { clearNext(); });
+    // Start immediately so clicking a video never requires a second click on
+    // the embedded player. The player falls back to muted playback if the
+    // browser blocks unmuted autoplay.
+    startPlayback();
 
     try {
       const video = await YT.api.video(id);
@@ -4018,6 +4080,9 @@ YT.player = (function () {
 
   /* =============================== SHORTS =============================== */
   let shortsState = { list: [] };
+  let shortObserver = null;
+  let shortPlayTimer = null;
+  let activeShortId = '';
 
   function shortFrameInner(v) {
     return '<img class="short-poster" ' + YT.thumbAttrs(v.id, { short: true }) + ' alt="">' +
@@ -4029,6 +4094,92 @@ YT.player = (function () {
     const v = YT.ui.getVideo(frame.dataset.id);
     frame.dataset.playing = '0';
     frame.innerHTML = v ? shortFrameInner(v) : '';
+  }
+
+  function stopShortPlayback() {
+    if (shortPlayTimer) { clearTimeout(shortPlayTimer); shortPlayTimer = null; }
+    YT.player.destroy();
+    YT.$$('.short-frame').forEach(f => {
+      if (f.dataset.playing === '1' || f.querySelector('iframe')) resetShortFrame(f);
+    });
+    activeShortId = '';
+  }
+
+  function syncShortSound() {
+    const muted = !!YT.store.state.settings.shortsMuted;
+    YT.$$('[data-act="short-mute"]').forEach(btn => {
+      btn.classList.toggle('muted', muted);
+      btn.setAttribute('aria-label', muted ? 'Unmute Short' : 'Mute Short');
+      btn.title = muted ? 'Tap to unmute' : 'Mute';
+      const use = btn.querySelector('use');
+      if (use) use.setAttribute('href', muted ? '#i-volume-off' : '#i-volume');
+    });
+  }
+
+  function shortSoundButton() {
+    const muted = !!YT.store.state.settings.shortsMuted;
+    return '<button class="short-top-btn' + (muted ? ' muted' : '') + '" data-act="short-mute" aria-label="' +
+      (muted ? 'Unmute Short' : 'Mute Short') + '" title="' + (muted ? 'Tap to unmute' : 'Mute') + '">' +
+      YT.icon(muted ? 'volume-off' : 'volume') + '</button>';
+  }
+
+  function playShort(section) {
+    if (!section) return;
+    const frame = section.querySelector('.short-frame');
+    if (!frame || !frame.dataset.id) return;
+    if (frame.dataset.playing === '1' && activeShortId === frame.dataset.id) return;
+    const id = frame.dataset.id;
+    const video = YT.ui.getVideo(id);
+    YT.player.destroy();
+    YT.$$('.short-frame').forEach(f => {
+      if (f !== frame && f.dataset.playing === '1') resetShortFrame(f);
+    });
+    frame.dataset.playing = '1';
+    activeShortId = id;
+    YT.player.load(id, {
+      container: frame,
+      loop: true,
+      muted: !!YT.store.state.settings.shortsMuted,
+      showAutoplayHint: false,
+      onAutoplayBlocked: function () {
+        YT.store.setSetting('shortsMuted', true);
+        syncShortSound();
+      },
+      onPlay: function () {
+        if (video) YT.store.addHistory(video, { duration: video.duration || 0 });
+      },
+      onError: function () {
+        frame.dataset.playing = '0';
+        activeShortId = '';
+        frame.innerHTML = '<div class="player-error"><p>This Short cannot be played here.</p>' +
+          '<a class="btn" href="https://www.youtube.com/shorts/' + encodeURIComponent(id) + '" target="_blank" rel="noopener">Open on YouTube</a></div>';
+      }
+    });
+  }
+
+  function startShortObserver() {
+    if (shortObserver) { shortObserver.disconnect(); shortObserver = null; }
+    const feed = YT.$('#shortsFeed');
+    if (!feed) return;
+    const sections = YT.$$('.short', feed);
+    if (!sections.length) return;
+    if (!('IntersectionObserver' in window)) { playShort(sections[0]); return; }
+    shortObserver = new IntersectionObserver(function (entries) {
+      let best = null;
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        if (!best || entry.intersectionRatio > best.intersectionRatio) best = entry;
+      }
+      if (!best || best.intersectionRatio < 0.55) return;
+      if (best.target.dataset.shortId === activeShortId) return;
+      if (shortPlayTimer) clearTimeout(shortPlayTimer);
+      const section = best.target;
+      shortPlayTimer = setTimeout(function () {
+        shortPlayTimer = null;
+        if (section.isConnected) playShort(section);
+      }, 120);
+    }, { root: feed, threshold: [0.25, 0.55, 0.8] });
+    sections.forEach(s => shortObserver.observe(s));
   }
 
   function shortSection(v) {
@@ -4043,6 +4194,7 @@ YT.player = (function () {
     return '<section class="short" data-short-id="' + YT.esc(v.id) + '">' +
       '<div class="short-stage">' +
         '<div class="short-frame" data-act="short-play" data-id="' + YT.esc(v.id) + '" data-playing="0">' + shortFrameInner(v) + '</div>' +
+        '<div class="short-actions-top">' + shortSoundButton() + '</div>' +
         '<div class="short-shade"></div>' +
         '<div class="short-overlay">' +
           '<div class="short-channel-row">' +
@@ -4107,37 +4259,29 @@ YT.player = (function () {
     const target = String(params.get('id') || '');
     h.title(target ? 'Shorts' : 'Shorts');
     h.setPage('<div class="shorts-page"><div class="short-empty"><span class="spinner"></span><p>Loading Shorts…</p></div></div>');
+    h.setCleanup(function () {
+      if (shortObserver) { shortObserver.disconnect(); shortObserver = null; }
+      stopShortPlayback();
+    });
 
     h.setAction(function (act, ds, el) {
       if (act === 'short-play') {
-        const frame = el.closest('.short-frame');
-        if (!frame) return true;
-        const id = frame.dataset.id;
-        const video = YT.ui.getVideo(id);
-        YT.player.destroy();
-        YT.$$('.short-frame').forEach(f => { if (f.dataset.playing === '1') resetShortFrame(f); });
-        frame.dataset.playing = '1';
-        YT.player.load(id, {
-          container: frame,
-          loop: true,
-          onPlay: function () {
-            if (video) YT.store.addHistory(video, { duration: video.duration || 0 });
-          },
-          onError: function () {
-            const v = YT.ui.getVideo(id);
-            if (v && !YT.store.isLiked(id)) { /* no-op */ }
-            frame.innerHTML = '<div class="player-error"><p>This Short cannot be played here.</p>' +
-              '<a class="btn" href="https://www.youtube.com/shorts/' + encodeURIComponent(id) + '" target="_blank" rel="noopener">Open on YouTube</a></div>';
-          }
-        });
+        playShort(el.closest('.short'));
+        return true;
+      }
+      if (act === 'short-mute') {
+        const muted = !YT.store.state.settings.shortsMuted;
+        YT.store.setSetting('shortsMuted', muted);
+        YT.player.mute(muted);
+        syncShortSound();
+        YT.toast(muted ? 'Shorts muted' : 'Sound on');
         return true;
       }
       if (act === 'short-next' || act === 'short-prev') {
         const section = el.closest('.short');
         const next = act === 'short-next' ? section.nextElementSibling : section.previousElementSibling;
         if (next) {
-          YT.player.destroy();
-          YT.$$('.short-frame').forEach(f => { if (f.dataset.playing === '1') resetShortFrame(f); });
+          stopShortPlayback();
           next.scrollIntoView({ behavior: 'smooth', block: 'start' });
         } else {
           YT.toast(act === 'short-next' ? 'No more Shorts right now' : 'This is the first Short');
@@ -4194,14 +4338,20 @@ YT.player = (function () {
     shortsState.list = list;
     h.setPage('<div class="shorts-page"><div class="shorts-feed" id="shortsFeed">' +
       list.map(v => shortSection(v)).join('') + '</div></div>');
+    syncShortSound();
 
     if (target) {
       requestAnimationFrame(function () {
         const el = document.querySelector('.short[data-short-id="' + target.replace(/"/g, '') + '"]');
         if (el) el.scrollIntoView({ block: 'start' });
+        startShortObserver();
       });
+    } else {
+      startShortObserver();
     }
   };
+
+  views.pauseShorts = stopShortPlayback;
 
   /* =============================== CHANNEL ============================== */
   const channelState = { id: '', tab: 'home', sort: 'newest', page: 1, videos: [], more: false, channel: null };
@@ -4982,10 +5132,7 @@ YT.player = (function () {
     h.setPage(h.notFound());
   };
 
-  YT.views.pauseShorts = function () {
-    YT.player.destroy();
-    YT.$$('.short-frame[data-playing="1"]').forEach(resetShortFrame);
-  };
+  YT.views.pauseShorts = stopShortPlayback;
 })();
 /* =========================================================================
    06 · APP — router, guide, header search, menus, shortcuts and actions
@@ -5594,6 +5741,14 @@ YT.app = (function () {
     if (YT.views.handleAction(act, ds, el)) return;
 
     switch (act) {
+      case 'video-save': {
+        const v = YT.ui.getVideo(ds.id);
+        if (v) YT.ui.saveModal(v);
+        else {
+          YT.api.video(ds.id).then(video => YT.ui.saveModal(video)).catch(() => YT.toast('Could not load this video'));
+        }
+        return;
+      }
       case 'video-menu': {
         const v = YT.ui.getVideo(ds.id);
         if (v) YT.ui.videoMenu(v, el);
